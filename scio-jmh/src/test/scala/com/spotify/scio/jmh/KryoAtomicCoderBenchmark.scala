@@ -24,13 +24,43 @@ import com.esotericsoftware.kryo.io.{Input, Output}
 import com.esotericsoftware.kryo.{Kryo, Serializer}
 import com.spotify.scio.coders._
 import com.twitter.chill.IKryoRegistrar
-import org.apache.beam.sdk.coders.{AtomicCoder, ByteArrayCoder, SerializableCoder, StringUtf8Coder}
+import org.apache.beam.sdk.coders.{Coder, AtomicCoder, ByteArrayCoder, SerializableCoder, StringUtf8Coder}
 import org.apache.beam.sdk.util.CoderUtils
 import org.openjdk.jmh.annotations._
 
 final case class UserId(bytes: Array[Byte])
 final case class User(id: UserId, username: String, email: String)
 final case class SpecializedUser(id: UserId, username: String, email: String)
+final case class SpecializedUserForDerived(id: UserId, username: String, email: String)
+
+object Implicits {
+  implicit def byteArrayCoder: Coder[Array[Byte]] = ByteArrayCoder.of()
+  implicit def stringCoder: Coder[String] = StringUtf8Coder.of()
+}
+
+import Implicits._
+
+object CoderDerivation {
+  import language.experimental.macros, magnolia._
+  type Typeclass[T] = Coder[T]
+
+  def combine[T](ctx: CaseClass[Coder, T]): Coder[T] =
+    new AtomicCoder[T] {
+      def encode(value: T, os: OutputStream): Unit =
+        ctx.parameters.foreach { p =>
+          p.typeclass.encode(p.dereference(value), os)
+        }
+
+      def decode(is: InputStream): T = {
+        ctx.construct { p => p.typeclass.decode(is) }
+      }
+    }
+
+  def dispatch[T](ctx: SealedTrait[Coder, T]): Coder[T] =
+    ???
+
+  implicit def gen[T]: Coder[T] = macro Magnolia.gen[T]
+}
 
 @BenchmarkMode(Array(Mode.AverageTime))
 @OutputTimeUnit(TimeUnit.NANOSECONDS)
@@ -45,11 +75,13 @@ class KryoAtomicCoderBenchmark {
 
   // use hand-optimized coders
   val specializedUser = SpecializedUser(userId, "johndoe", "johndoe@spotify.com")
+  val specializedUserForDerived = SpecializedUserForDerived(userId, "johndoe", "johndoe@spotify.com")
 
   val kryoCoder = new KryoAtomicCoder[User](KryoOptions())
   val javaCoder = SerializableCoder.of(classOf[User])
   val specializedCoder = new SpecializedCoder
   val specializedKryoCoder = new KryoAtomicCoder[SpecializedUser](KryoOptions())
+  val derivedCoder = CoderDerivation.gen[SpecializedUserForDerived]
 
   @Benchmark
   def kryoEncode: Array[Byte] = {
@@ -71,10 +103,17 @@ class KryoAtomicCoderBenchmark {
     CoderUtils.encodeToByteArray(specializedKryoCoder, specializedUser)
   }
 
+  @Benchmark
+  def derivedEncode: Array[Byte] = {
+    CoderUtils.encodeToByteArray(derivedCoder, specializedUserForDerived)
+  }
+
+
   val kryoEncoded = kryoEncode
   val javaEncoded = javaEncode
   val customEncoded = customEncode
   val customKryoEncoded = customKryoEncode
+  val derivedEncoded = derivedEncode
 
   @Benchmark
   def kryoDecode: User = {
@@ -94,6 +133,11 @@ class KryoAtomicCoderBenchmark {
   @Benchmark
   def customKryoDecode: SpecializedUser = {
     CoderUtils.decodeFromByteArray(specializedKryoCoder, customKryoEncoded)
+  }
+
+  @Benchmark
+  def derivedDecode: SpecializedUserForDerived = {
+    CoderUtils.decodeFromByteArray(derivedCoder, derivedEncoded)
   }
 }
 
